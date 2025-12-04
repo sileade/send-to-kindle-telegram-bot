@@ -34,8 +34,10 @@ RUN which ebook-convert && ebook-convert --version
 # Create working directory
 WORKDIR /app
 
-# Create files directory with proper permissions
-RUN mkdir -p /app/files && chmod 777 /app/files
+# Create files directory and symlink (bot expects /files/)
+RUN mkdir -p /app/files && \
+    chmod 777 /app/files && \
+    ln -s /app/files /files
 
 # Copy go.mod and go.sum first for better caching
 COPY go.mod go.sum ./
