@@ -86,6 +86,7 @@ func (b *SendToKindleBot) documentHandler(bot *tb.Bot) func(msg *tb.Message) {
 			if err := convert(originalFilePath, outputFilePath); err != nil {
 				log.Println("could not convert file", err)
 				respond(bot, msg, "Sorry. I could not convert file")
+				return
 			}
 			fileToSend = outputFilePath
 			defer removeSilently(outputFilePath)
@@ -94,7 +95,9 @@ func (b *SendToKindleBot) documentHandler(bot *tb.Bot) func(msg *tb.Message) {
 		if err := b.sendFileViaEmail(fileToSend); err != nil {
 			log.Println("could not send file", err)
 			respond(bot, msg, "Sorry. I could not send file")
+			return
 		}
+		respond(bot, msg, "File sent successfully!")
 	}
 }
 
@@ -118,9 +121,7 @@ func convert(in, out string) error {
 	if err := cmd.Run(); err != nil {
 		return err
 	}
-	if err := cmd.Wait(); err != nil {
-		return err
-	}
+	// Remove redundant Wait() - Run() already waits for completion
 	if _, err := os.Stat(out); errors.Is(err, os.ErrNotExist) {
 		return errConversion
 	}
@@ -148,6 +149,14 @@ func (b *SendToKindleBot) verifyConfig() error {
 	}
 	if b.SMTPPort == "" {
 		b.SMTPPort = defaultSMTPPort
+	}
+	// Remove port from SMTPHost if it contains one
+	if strings.Contains(b.SMTPHost, ":") {
+		parts := strings.Split(b.SMTPHost, ":")
+		b.SMTPHost = parts[0]
+		if len(parts) > 1 && b.SMTPPort == defaultSMTPPort {
+			b.SMTPPort = parts[1]
+		}
 	}
 	return nil
 }
