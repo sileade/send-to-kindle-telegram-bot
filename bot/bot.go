@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"github.com/scorredoira/email"
@@ -37,12 +38,13 @@ var (
 
 // SendToKindleBot stores bot configuration
 type SendToKindleBot struct {
-	Token     string
-	EmailFrom string
-	EmailTo   string
-	SMTPHost  string
-	SMTPPort  string
-	Password  string
+	Token        string
+	EmailFrom    string
+	EmailTo      string
+	SMTPHost     string
+	SMTPPort     string
+	Password     string
+	SMTPInsecure bool
 }
 
 // Start starts bot. It is blocking.
@@ -77,6 +79,7 @@ func (b *SendToKindleBot) documentHandler(bot *tb.Bot) func(msg *tb.Message) {
 		if err := bot.Download(&doc.File, originalFilePath); err != nil {
 			log.Println("could not download file", err)
 			respond(bot, msg, "Sorry. I could not download file")
+			return
 		}
 		defer removeSilently(originalFilePath)
 
@@ -121,7 +124,6 @@ func convert(in, out string) error {
 	if err := cmd.Run(); err != nil {
 		return err
 	}
-	// Remove redundant Wait() - Run() already waits for completion
 	if _, err := os.Stat(out); errors.Is(err, os.ErrNotExist) {
 		return errConversion
 	}
@@ -172,8 +174,62 @@ func (b *SendToKindleBot) sendFileViaEmail(path string) error {
 
 	auth := smtp.PlainAuth("", b.EmailFrom, b.Password, b.SMTPHost)
 	addr := fmt.Sprintf("%s:%s", b.SMTPHost, b.SMTPPort)
-	if err := email.Send(addr, auth, msg); err != nil {
+
+	// Configure TLS
+	tlsConfig := &tls.Config{
+		ServerName:         b.SMTPHost,
+		InsecureSkipVerify: b.SMTPInsecure,
+	}
+
+	// Send with custom TLS config
+	if err := sendEmailWithTLS(addr, auth, msg, tlsConfig); err != nil {
 		return err
 	}
 	return nil
+}
+
+// sendEmailWithTLS sends email with custom TLS configuration
+func sendEmailWithTLS(addr string, auth smtp.Auth, msg *email.Message, tlsConfig *tls.Config) error {
+	// This is a workaround since the email library doesn't expose TLS config
+	// We need to use the standard approach
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	if err = c.StartTLS(tlsConfig); err != nil {
+		return err
+	}
+
+	if err = c.Auth(auth); err != nil {
+		return err
+	}
+
+	if err = c.Mail(msg.From.Address); err != nil {
+		return err
+	}
+
+	for _, to := range msg.To {
+		if err = c.Rcpt(to); err != nil {
+			return err
+		}
+	}
+
+	w, err := c.Data()
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write(msg.Bytes())
+	if err != nil {
+		return err
+	}
+
+	err = w.Close()
+	if err != nil {
+		return err
+	}
+
+	return c.Quit()
 }
