@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  sendtokindle:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sendtokindle-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./files:/files
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Uncomment for memory limit (adjust as needed)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 512M
