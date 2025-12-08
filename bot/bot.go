@@ -11,6 +11,7 @@ import (
 	"net/smtp"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -29,6 +30,8 @@ var (
 	ErrNoEmailFrom = errors.New("emailfrom not set")
 	// ErrNoEmailTo - represents a validation error when EmailTo not set
 	ErrNoEmailTo = errors.New("emailto not set")
+	// ErrNoSMTPHost - represents a validation error when SMTPHost not set
+	ErrNoSMTPHost = errors.New("smtp host not set")
 	// ErrStartup - represents an error during bot initialization process
 	ErrStartup = errors.New("could not create telebot instance")
 
@@ -54,6 +57,9 @@ func (b *SendToKindleBot) Start() error {
 		return err
 	}
 
+	log.Println("[INFO] Starting Send-to-Kindle bot...")
+	log.Printf("[INFO] Using SMTP: %s:%s\n", b.SMTPHost, b.SMTPPort)
+
 	bot, err := tb.NewBot(tb.Settings{
 		Token:  b.Token,
 		Poller: &tb.LongPoller{Timeout: 10 * time.Second},
@@ -62,6 +68,7 @@ func (b *SendToKindleBot) Start() error {
 		return ErrStartup
 	}
 
+	log.Println("[INFO] Bot successfully created and listening for documents...")
 	bot.Handle(tb.OnDocument, b.documentHandler(bot))
 	bot.Start()
 
@@ -71,13 +78,28 @@ func (b *SendToKindleBot) Start() error {
 func (b *SendToKindleBot) documentHandler(bot *tb.Bot) func(msg *tb.Message) {
 	return func(msg *tb.Message) {
 		doc := msg.Document
-		nameParts := strings.Split(doc.FileName, ".")
-		fileNameWithoutExtension := strings.Join(nameParts[:len(nameParts)-1], "")
-		extension := nameParts[len(nameParts)-1]
+		log.Printf("[DEBUG] Received document: %s (size: %d bytes)\n", doc.FileName, doc.Size)
 
-		originalFilePath := tmpFilesPath + doc.FileName
+		// Get file extension and normalize to lowercase
+		extension := strings.ToLower(filepath.Ext(doc.FileName))
+		// Remove the leading dot if present
+		if strings.HasPrefix(extension, ".") {
+			extension = extension[1:]
+		}
+
+		// Get filename without extension
+		fileNameWithoutExtension := strings.TrimSuffix(doc.FileName, filepath.Ext(doc.FileName))
+
+		// Ensure tmpFilesPath exists
+		if err := ensureDirectory(tmpFilesPath); err != nil {
+			log.Printf("[ERROR] Could not create directory %s: %v\n", tmpFilesPath, err)
+			respond(bot, msg, "Sorry. System error: could not prepare file storage")
+			return
+		}
+
+		originalFilePath := filepath.Join(tmpFilesPath, doc.FileName)
 		if err := bot.Download(&doc.File, originalFilePath); err != nil {
-			log.Println("could not download file", err)
+			log.Printf("[ERROR] Could not download file: %v\n", err)
 			respond(bot, msg, "Sorry. I could not download file")
 			return
 		}
@@ -85,9 +107,10 @@ func (b *SendToKindleBot) documentHandler(bot *tb.Bot) func(msg *tb.Message) {
 
 		fileToSend := originalFilePath
 		if needToConvert(extension) {
-			outputFilePath := tmpFilesPath + fileNameWithoutExtension + ".mobi"
+			log.Printf("[DEBUG] Converting %s to MOBI format...\n", extension)
+			outputFilePath := filepath.Join(tmpFilesPath, fileNameWithoutExtension+".mobi")
 			if err := convert(originalFilePath, outputFilePath); err != nil {
-				log.Println("could not convert file", err)
+				log.Printf("[ERROR] Could not convert file: %v\n", err)
 				respond(bot, msg, "Sorry. I could not convert file")
 				return
 			}
@@ -95,12 +118,14 @@ func (b *SendToKindleBot) documentHandler(bot *tb.Bot) func(msg *tb.Message) {
 			defer removeSilently(outputFilePath)
 		}
 
-		if err := b.sendFileViaEmail(fileToSend); err != nil {
-			log.Println("could not send file", err)
-			respond(bot, msg, "Sorry. I could not send file")
+		log.Printf("[DEBUG] Sending file via email to %s...\n", b.EmailTo)
+		if err := b.sendFileViaEmail(fileToSend, doc.FileName); err != nil {
+			log.Printf("[ERROR] Could not send file: %v\n", err)
+			respond(bot, msg, "Sorry. I could not send file. Check logs for details")
 			return
 		}
-		respond(bot, msg, "File sent successfully!")
+		respond(bot, msg, "✅ File sent successfully to your Kindle!")
+		log.Printf("[INFO] Successfully sent %s to %s\n", doc.FileName, b.EmailTo)
 	}
 }
 
@@ -115,16 +140,19 @@ func needToConvert(extension string) bool {
 
 func respond(bot *tb.Bot, m *tb.Message, text string) {
 	if _, err := bot.Send(m.Sender, text); err != nil {
-		log.Println(fmt.Sprintf("could not send a message to %d", m.Sender.ID), err)
+		log.Printf("[ERROR] Could not send message to %d: %v\n", m.Sender.ID, err)
 	}
 }
 
 func convert(in, out string) error {
+	log.Printf("[DEBUG] Running ebook-convert: %s -> %s\n", in, out)
 	cmd := exec.Command("ebook-convert", in, out)
 	if err := cmd.Run(); err != nil {
+		log.Printf("[ERROR] ebook-convert error: %v\n", err)
 		return err
 	}
 	if _, err := os.Stat(out); errors.Is(err, os.ErrNotExist) {
+		log.Printf("[ERROR] Conversion failed: output file not created\n")
 		return errConversion
 	}
 	return nil
@@ -132,8 +160,12 @@ func convert(in, out string) error {
 
 func removeSilently(path string) {
 	if err := os.Remove(path); err != nil {
-		log.Println(fmt.Sprintf("could not delete file %s", path), err)
+		log.Printf("[WARN] Could not delete file %s: %v\n", path, err)
 	}
+}
+
+func ensureDirectory(path string) error {
+	return os.MkdirAll(path, 0755)
 }
 
 func (b *SendToKindleBot) verifyConfig() error {
@@ -149,6 +181,9 @@ func (b *SendToKindleBot) verifyConfig() error {
 	if b.EmailTo == "" {
 		return ErrNoEmailTo
 	}
+	if b.SMTPHost == "" {
+		return ErrNoSMTPHost
+	}
 	if b.SMTPPort == "" {
 		b.SMTPPort = defaultSMTPPort
 	}
@@ -163,12 +198,15 @@ func (b *SendToKindleBot) verifyConfig() error {
 	return nil
 }
 
-func (b *SendToKindleBot) sendFileViaEmail(path string) error {
-	msg := email.NewMessage("", "")
-	msg.From = mail.Address{Name: "From", Address: b.EmailFrom}
+func (b *SendToKindleBot) sendFileViaEmail(path string, originalFileName string) error {
+	// Create email with proper subject line
+	subject := fmt.Sprintf("Book: %s", originalFileName)
+	msg := email.NewMessage(subject, "")
+	msg.From = mail.Address{Name: "Send-to-Kindle Bot", Address: b.EmailFrom}
 	msg.To = []string{b.EmailTo}
 
 	if err := msg.Attach(path); err != nil {
+		log.Printf("[ERROR] Could not attach file: %v\n", err)
 		return err
 	}
 
@@ -190,46 +228,65 @@ func (b *SendToKindleBot) sendFileViaEmail(path string) error {
 
 // sendEmailWithTLS sends email with custom TLS configuration
 func sendEmailWithTLS(addr string, auth smtp.Auth, msg *email.Message, tlsConfig *tls.Config) error {
-	// This is a workaround since the email library doesn't expose TLS config
-	// We need to use the standard approach
+	// Dial to SMTP server
 	c, err := smtp.Dial(addr)
 	if err != nil {
-		return err
+		log.Printf("[ERROR] Could not connect to SMTP server %s: %v\n", addr, err)
+		return fmt.Errorf("could not connect to SMTP server: %w", err)
 	}
 	defer c.Close()
 
+	// Start TLS connection
 	if err = c.StartTLS(tlsConfig); err != nil {
-		return err
+		log.Printf("[ERROR] Could not start TLS: %v\n", err)
+		return fmt.Errorf("could not start TLS: %w", err)
 	}
 
+	// Authenticate after TLS
 	if err = c.Auth(auth); err != nil {
-		return err
+		log.Printf("[ERROR] Authentication failed: %v\n", err)
+		return fmt.Errorf("authentication failed (check email and password): %w", err)
 	}
 
+	// Send mail
 	if err = c.Mail(msg.From.Address); err != nil {
-		return err
+		log.Printf("[ERROR] Could not set sender: %v\n", err)
+		return fmt.Errorf("could not set sender: %w", err)
 	}
 
+	// Add recipients
 	for _, to := range msg.To {
 		if err = c.Rcpt(to); err != nil {
-			return err
+			log.Printf("[ERROR] Could not add recipient %s: %v\n", to, err)
+			return fmt.Errorf("could not add recipient: %w", err)
 		}
 	}
 
+	// Send data
 	w, err := c.Data()
 	if err != nil {
-		return err
+		log.Printf("[ERROR] Could not start data transmission: %v\n", err)
+		return fmt.Errorf("could not start data transmission: %w", err)
 	}
 
 	_, err = w.Write(msg.Bytes())
 	if err != nil {
-		return err
+		log.Printf("[ERROR] Could not write message data: %v\n", err)
+		return fmt.Errorf("could not write message data: %w", err)
 	}
 
 	err = w.Close()
 	if err != nil {
-		return err
+		log.Printf("[ERROR] Could not close data transmission: %v\n", err)
+		return fmt.Errorf("could not close data transmission: %w", err)
 	}
 
-	return c.Quit()
+	// Quit
+	if err = c.Quit(); err != nil {
+		log.Printf("[ERROR] Could not close SMTP connection: %v\n", err)
+		return fmt.Errorf("could not close SMTP connection: %w", err)
+	}
+
+	log.Printf("[DEBUG] Email sent successfully\n")
+	return nil
 }
