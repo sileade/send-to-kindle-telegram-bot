@@ -36,7 +36,9 @@ var (
 	ErrStartup = errors.New("could not create telebot instance")
 
 	errConversion    = errors.New("could not convert file")
-	supportedFormats = []string{"doc", "docx", "rtf", "htm", "html", "txt", "mobi", "pdf"}
+	// FIXED: Changed from MOBI to EPUB as Amazon discontinued MOBI support in Send to Kindle service
+	// EPUB is the recommended format for modern Kindle devices (including Paperwhite 2024)
+	supportedFormats = []string{"epub", "doc", "docx", "rtf", "htm", "html", "txt", "pdf"}
 )
 
 // SendToKindleBot stores bot configuration
@@ -107,8 +109,9 @@ func (b *SendToKindleBot) documentHandler(bot *tb.Bot) func(msg *tb.Message) {
 
 		fileToSend := originalFilePath
 		if needToConvert(extension) {
-			log.Printf("[DEBUG] Converting %s to MOBI format...\n", extension)
-			outputFilePath := filepath.Join(tmpFilesPath, fileNameWithoutExtension+".mobi")
+			// FIXED: Changed from MOBI to EPUB format
+			log.Printf("[DEBUG] Converting %s to EPUB format...\n", extension)
+			outputFilePath := filepath.Join(tmpFilesPath, fileNameWithoutExtension+".epub")
 			if err := convert(originalFilePath, outputFilePath); err != nil {
 				log.Printf("[ERROR] Could not convert file: %v\n", err)
 				respond(bot, msg, "Sorry. I could not convert file")
