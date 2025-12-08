@@ -19,10 +19,11 @@ func main() {
 		EmailFrom:    os.Getenv("UBOT_EMAIL_FROM"),
 		EmailTo:      os.Getenv("UBOT_EMAIL_TO"),
 		SMTPHost:     os.Getenv("UBOT_SMTP_HOST"),
+		SMTPPort:     os.Getenv("UBOT_SMTP_PORT"),
 		Password:     os.Getenv("UBOT_PASSWORD"),
 		SMTPInsecure: smtpInsecure,
 	}
 	if err := unkindleBot.Start(); err != nil {
-		log.Fatal("could not start telegram bot", err)
+		log.Fatal("[ERROR] could not start telegram bot:", err)
 	}
 }
