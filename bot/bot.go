@@ -13,12 +13,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	defaultSMTPPort = "587"
-	tmpFilesPath    = "/files/"
+	defaultSMTPPort       = "587"
+	defaultTmpFilesPath   = "/files/"
+	buttonsPerRow         = 2
+	callbackDataPrefix    = "send_kindle:"
+	maxFileNameLength     = 255
+	maxDeviceNameLength   = 100
 )
 
 var (
@@ -34,8 +39,10 @@ var (
 	ErrNoSMTPHost = errors.New("smtp host not set")
 	// ErrStartup - represents an error during bot initialization process
 	ErrStartup = errors.New("could not create telebot instance")
+	// ErrInvalidFileName - represents an error for invalid filename
+	ErrInvalidFileName = errors.New("invalid filename")
 
-	errConversion    = errors.New("could not convert file")
+	errConversion = errors.New("could not convert file")
 	// FIXED: Changed from MOBI to EPUB as Amazon discontinued MOBI support in Send to Kindle service
 	// EPUB is the recommended format for modern Kindle devices (including Paperwhite 2024)
 	supportedFormats = []string{"epub", "doc", "docx", "rtf", "htm", "html", "txt", "pdf"}
@@ -45,7 +52,7 @@ var (
 type SendToKindleBot struct {
 	Token          string
 	EmailFrom      string
-	EmailTo        string           // Single device (fallback)
+	EmailTo        string            // Single device (fallback)
 	KindleDevices  map[string]string // Multiple devices: name -> email
 	SMTPHost       string
 	SMTPPort       string
@@ -53,6 +60,8 @@ type SendToKindleBot struct {
 	SMTPInsecure   bool
 	bot            *tb.Bot
 	fileStateCache map[int]map[string]string // userID -> {filePath, originalFileName}
+	cacheMutex     sync.RWMutex              // FIXED: Added mutex for thread-safe access
+	tmpFilesPath   string                    // FIXED: Made configurable
 }
 
 // Start starts bot. It is blocking.
@@ -62,8 +71,19 @@ func (b *SendToKindleBot) Start() error {
 		return err
 	}
 
+	// FIXED: Set default tmp files path if not set
+	if b.tmpFilesPath == "" {
+		b.tmpFilesPath = defaultTmpFilesPath
+	}
+
 	log.Println("[INFO] Starting Send-to-Kindle bot...")
 	log.Printf("[INFO] Using SMTP: %s:%s\n", b.SMTPHost, b.SMTPPort)
+	log.Printf("[INFO] Using temporary files path: %s\n", b.tmpFilesPath)
+
+	// FIXED: Warn if insecure TLS is enabled
+	if b.SMTPInsecure {
+		log.Println("[WARN] SMTP insecure mode is enabled - TLS certificate verification is disabled!")
+	}
 
 	// Initialize file state cache
 	b.fileStateCache = make(map[int]map[string]string)
@@ -75,7 +95,8 @@ func (b *SendToKindleBot) Start() error {
 			log.Printf("[DEBUG]   - %s\n", name)
 		}
 	} else if b.EmailTo != "" {
-		log.Printf("[INFO] Using single Kindle device: %s\n", b.EmailTo)
+		// FIXED: Mask email in logs for security
+		log.Printf("[INFO] Using single Kindle device: %s\n", maskEmail(b.EmailTo))
 	}
 
 	bot, err := tb.NewBot(tb.Settings{
@@ -100,29 +121,37 @@ func (b *SendToKindleBot) documentHandler(bot *tb.Bot) func(msg *tb.Message) {
 	return func(msg *tb.Message) {
 		doc := msg.Document
 		userID := msg.Sender.ID
-		log.Printf("[DEBUG] Received document: %s (size: %d bytes)\n", doc.FileName, doc.Size)
+		log.Printf("[DEBUG] Received document: %s from user %d\n", doc.FileName, userID)
+
+		// FIXED: Validate and sanitize filename
+		sanitizedFileName, err := sanitizeFileName(doc.FileName)
+		if err != nil {
+			log.Printf("[ERROR] Invalid filename: %v\n", err)
+			respond(bot, msg, "❌ Invalid filename. Please check the file and try again.")
+			return
+		}
 
 		// Get file extension and normalize to lowercase
-		extension := strings.ToLower(filepath.Ext(doc.FileName))
+		extension := strings.ToLower(filepath.Ext(sanitizedFileName))
 		// Remove the leading dot if present
 		if strings.HasPrefix(extension, ".") {
 			extension = extension[1:]
 		}
 
 		// Get filename without extension
-		fileNameWithoutExtension := strings.TrimSuffix(doc.FileName, filepath.Ext(doc.FileName))
+		fileNameWithoutExtension := strings.TrimSuffix(sanitizedFileName, filepath.Ext(sanitizedFileName))
 
 		// Ensure tmpFilesPath exists
-		if err := ensureDirectory(tmpFilesPath); err != nil {
-			log.Printf("[ERROR] Could not create directory %s: %v\n", tmpFilesPath, err)
-			respond(bot, msg, "Sorry. System error: could not prepare file storage")
+		if err := ensureDirectory(b.tmpFilesPath); err != nil {
+			log.Printf("[ERROR] Could not create directory %s: %v\n", b.tmpFilesPath, err)
+			respond(bot, msg, "❌ System error: could not prepare file storage")
 			return
 		}
 
-		originalFilePath := filepath.Join(tmpFilesPath, doc.FileName)
+		originalFilePath := filepath.Join(b.tmpFilesPath, sanitizedFileName)
 		if err := bot.Download(&doc.File, originalFilePath); err != nil {
 			log.Printf("[ERROR] Could not download file: %v\n", err)
-			respond(bot, msg, "Sorry. I could not download file")
+			respond(bot, msg, "❌ Could not download file")
 			return
 		}
 
@@ -130,35 +159,37 @@ func (b *SendToKindleBot) documentHandler(bot *tb.Bot) func(msg *tb.Message) {
 		if needToConvert(extension) {
 			// FIXED: Changed from MOBI to EPUB format
 			log.Printf("[DEBUG] Converting %s to EPUB format...\n", extension)
-			outputFilePath := filepath.Join(tmpFilesPath, fileNameWithoutExtension+".epub")
+			outputFilePath := filepath.Join(b.tmpFilesPath, fileNameWithoutExtension+".epub")
 			if err := convert(originalFilePath, outputFilePath); err != nil {
 				log.Printf("[ERROR] Could not convert file: %v\n", err)
-				respond(bot, msg, "Sorry. I could not convert file")
+				respond(bot, msg, "❌ Could not convert file")
 				removeSilently(originalFilePath)
 				return
 			}
 			fileToSend = outputFilePath
 		}
 
-		// Store file info for callback handler
+		// Store file info for callback handler (FIXED: with mutex)
+		b.cacheMutex.Lock()
 		if _, exists := b.fileStateCache[userID]; !exists {
 			b.fileStateCache[userID] = make(map[string]string)
 		}
 		b.fileStateCache[userID]["filePath"] = fileToSend
-		b.fileStateCache[userID]["originalFileName"] = doc.FileName
+		b.fileStateCache[userID]["originalFileName"] = sanitizedFileName
 		b.fileStateCache[userID]["originalFilePath"] = originalFilePath
+		b.cacheMutex.Unlock()
 
 		// If only one device, send directly
 		if len(b.KindleDevices) <= 1 && b.EmailTo != "" {
-			log.Printf("[DEBUG] Sending file via email to %s...\n", b.EmailTo)
-			if err := b.sendToKindle(fileToSend, doc.FileName, b.EmailTo); err != nil {
+			log.Printf("[DEBUG] Sending file via email to %s...\n", maskEmail(b.EmailTo))
+			if err := b.sendToKindle(fileToSend, sanitizedFileName, b.EmailTo); err != nil {
 				log.Printf("[ERROR] Could not send file: %v\n", err)
-				respond(bot, msg, "Sorry. I could not send file. Check logs for details")
+				respond(bot, msg, "❌ Could not send file. Check logs for details")
 				b.cleanupFiles(userID)
 				return
 			}
 			respond(bot, msg, "✅ File sent successfully to your Kindle!")
-			log.Printf("[INFO] Successfully sent %s to %s\n", doc.FileName, b.EmailTo)
+			log.Printf("[INFO] Successfully sent %s to %s\n", sanitizedFileName, maskEmail(b.EmailTo))
 			b.cleanupFiles(userID)
 			return
 		}
@@ -170,7 +201,7 @@ func (b *SendToKindleBot) documentHandler(bot *tb.Bot) func(msg *tb.Message) {
 		}
 
 		// No devices configured
-		respond(bot, msg, "Sorry. No Kindle devices configured")
+		respond(bot, msg, "❌ No Kindle devices configured")
 		b.cleanupFiles(userID)
 	}
 }
@@ -180,30 +211,38 @@ func (b *SendToKindleBot) showDeviceSelection(bot *tb.Bot, msg *tb.Message, user
 
 	for deviceName, deviceEmail := range b.KindleDevices {
 		// Create callback data: "send_kindle:deviceName"
-	
-callbackData := fmt.Sprintf("send_kindle:%s", deviceName)
+		callbackData := fmt.Sprintf("%s%s", callbackDataPrefix, deviceName)
 		button := tb.InlineButton{
 			Text: deviceName,
 			Data: callbackData,
 		}
 		buttons = append(buttons, button)
-		log.Printf("[DEBUG] Device button: %s (%s)\n", deviceName, deviceEmail)
+		log.Printf("[DEBUG] Device button: %s (%s)\n", deviceName, maskEmail(deviceEmail))
 	}
 
-	// Create inline keyboard
-	inlineKeys := [][]tb.InlineButton{{buttons[0]}}
-	if len(buttons) > 1 {
-		inlineKeys = append(inlineKeys, buttons[1:])
+	// FIXED: Proper button layout with configurable buttons per row
+	inlineKeys := make([][]tb.InlineButton, 0)
+	for i := 0; i < len(buttons); i += buttonsPerRow {
+		end := i + buttonsPerRow
+		if end > len(buttons) {
+			end = len(buttons)
+		}
+		inlineKeys = append(inlineKeys, buttons[i:end])
 	}
 
 	inlineMarkup := &tb.ReplyMarkup{
 		InlineKeyboard: inlineKeys,
 	}
 
+	b.cacheMutex.RLock()
+	originalFileName := b.fileStateCache[userID]["originalFileName"]
+	b.cacheMutex.RUnlock()
+
 	responseMsg := fmt.Sprintf("📱 Which Kindle device would you like to send '%s' to?\n\nSelect one:",
-		b.fileStateCache[userID]["originalFileName"])
+		originalFileName)
 	if _, err := bot.Send(msg.Sender, responseMsg, inlineMarkup); err != nil {
 		log.Printf("[ERROR] Could not send device selection: %v\n", err)
+		respond(bot, msg, "❌ Could not show device selection. Please try again.")
 	}
 }
 
@@ -214,25 +253,28 @@ func (b *SendToKindleBot) callbackHandler(bot *tb.Bot) func(c *tb.Callback) {
 
 		log.Printf("[DEBUG] Callback from user %d: %s\n", userID, callbackData)
 
-		if !strings.HasPrefix(callbackData, "send_kindle:") {
+		if !strings.HasPrefix(callbackData, callbackDataPrefix) {
 			log.Printf("[DEBUG] Unknown callback: %s\n", callbackData)
 			return
 		}
 
-		deviceName := strings.TrimPrefix(callbackData, "send_kindle:")
+		deviceName := strings.TrimPrefix(callbackData, callbackDataPrefix)
 		deviceEmail, exists := b.KindleDevices[deviceName]
 		if !exists {
 			log.Printf("[ERROR] Device not found: %s\n", deviceName)
-			bot.Respond(c, &tb.ReplyMarkup{})
+			bot.Respond(c, &tb.CallbackResponse{})
 			bot.Send(c.Sender, "❌ Device not found")
 			return
 		}
 
-		// Get file info from cache
+		// Get file info from cache (FIXED: with mutex)
+		b.cacheMutex.RLock()
 		fileInfo, exists := b.fileStateCache[userID]
+		b.cacheMutex.RUnlock()
+
 		if !exists {
 			log.Printf("[ERROR] No file in cache for user %d\n", userID)
-			bot.Respond(c, &tb.ReplyMarkup{})
+			bot.Respond(c, &tb.CallbackResponse{})
 			bot.Send(c.Sender, "❌ File not found. Please send it again.")
 			return
 		}
@@ -241,18 +283,18 @@ func (b *SendToKindleBot) callbackHandler(bot *tb.Bot) func(c *tb.Callback) {
 		originalFileName := fileInfo["originalFileName"]
 
 		// Send to selected device
-		log.Printf("[DEBUG] Sending file to %s (%s)...\n", deviceName, deviceEmail)
+		log.Printf("[DEBUG] Sending file to %s (%s)...\n", deviceName, maskEmail(deviceEmail))
 		if err := b.sendToKindle(filePath, originalFileName, deviceEmail); err != nil {
 			log.Printf("[ERROR] Could not send file to %s: %v\n", deviceName, err)
-			bot.Respond(c, &tb.ReplyMarkup{})
+			bot.Respond(c, &tb.CallbackResponse{})
 			bot.Send(c.Sender, fmt.Sprintf("❌ Could not send to %s. Try again.", deviceName))
 			return
 		}
 
 		// Notify success
-		bot.Respond(c, &tb.ReplyMarkup{})
+		bot.Respond(c, &tb.CallbackResponse{})
 		bot.Send(c.Sender, fmt.Sprintf("✅ Book sent to %s!", deviceName))
-		log.Printf("[INFO] Successfully sent %s to %s (%s)\n", originalFileName, deviceName, deviceEmail)
+		log.Printf("[INFO] Successfully sent %s to %s (%s)\n", originalFileName, deviceName, maskEmail(deviceEmail))
 
 		// Cleanup
 		b.cleanupFiles(userID)
@@ -260,7 +302,7 @@ func (b *SendToKindleBot) callbackHandler(bot *tb.Bot) func(c *tb.Callback) {
 }
 
 func (b *SendToKindleBot) sendToKindle(filePath string, originalFileName string, kindleEmail string) error {
-	log.Printf("[DEBUG] Sending file via email to %s...\n", kindleEmail)
+	log.Printf("[DEBUG] Sending file via email to %s...\n", maskEmail(kindleEmail))
 
 	// Create email with proper subject line
 	subject := fmt.Sprintf("Book: %s", originalFileName)
@@ -290,6 +332,9 @@ func (b *SendToKindleBot) sendToKindle(filePath string, originalFileName string,
 }
 
 func (b *SendToKindleBot) cleanupFiles(userID int) {
+	b.cacheMutex.Lock()
+	defer b.cacheMutex.Unlock()
+
 	if fileInfo, exists := b.fileStateCache[userID]; exists {
 		if filePath, ok := fileInfo["filePath"]; ok {
 			removeSilently(filePath)
@@ -312,7 +357,7 @@ func needToConvert(extension string) bool {
 
 func respond(bot *tb.Bot, m *tb.Message, text string) {
 	if _, err := bot.Send(m.Sender, text); err != nil {
-		log.Printf("[ERROR] Could not send message to %d: %v\n", m.Sender.ID, err)
+		log.Printf("[ERROR] Could not send message to user %d: %v\n", m.Sender.ID, err)
 	}
 }
 
@@ -434,4 +479,47 @@ func sendEmailWithTLS(addr string, auth smtp.Auth, msg *email.Message, tlsConfig
 
 	log.Printf("[DEBUG] Email sent successfully\n")
 	return nil
+}
+
+// FIXED: Added sanitizeFileName to prevent path traversal attacks
+func sanitizeFileName(fileName string) (string, error) {
+	if fileName == "" {
+		return "", ErrInvalidFileName
+	}
+
+	// Check length
+	if len(fileName) > maxFileNameLength {
+		return "", ErrInvalidFileName
+	}
+
+	// Remove path separators to prevent directory traversal
+	fileName = filepath.Base(fileName)
+
+	// Remove any remaining dangerous characters
+	fileName = strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return -1 // Remove control characters
+		}
+		switch r {
+		case '<', '>', ':', '"', '|', '?', '*', 0:
+			return -1 // Remove invalid filename characters
+		}
+		return r
+	}, fileName)
+
+	if fileName == "" {
+		return "", ErrInvalidFileName
+	}
+
+	return fileName, nil
+}
+
+// FIXED: Added maskEmail to hide sensitive information in logs
+func maskEmail(email string) string {
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		return "***@***"
+	}
+	// Show only domain part
+	return "***@" + parts[1]
 }
