@@ -212,3 +212,77 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 -   This project was inspired by the original work of [Michael Fomenko](https://github.com/michaelfmnk).
 -   Thanks to the developers of [Telebot](https://github.com/tucnak/telebot) and [Calibre](https://calibre-ebook.com/).
+
+## 🚨 Troubleshooting
+
+If books are not arriving on your Kindle, follow these steps to diagnose the issue. The most common problems are related to configuration, not code bugs.
+
+### Step 1: Check Docker Logs
+
+This is the most important step. The logs will tell you exactly what is failing.
+
+```shell
+docker-compose logs -f sendtokindle
+```
+
+Look for `[ERROR]` messages:
+
+| Log Message | Meaning | Solution |
+|---|---|---|
+| `Authentication failed` | Incorrect email/password | [Use an App-Specific Password](#-use-an-app-specific-password) |
+| `Could not connect to SMTP server` | Wrong SMTP host/port | [Verify SMTP Settings](#-verify-smtp-settings) |
+| `emailto not set` | No Kindle email configured | [Configure Your Kindle Email](#-configure-your-kindle-email) |
+| `Could not convert file` | Calibre conversion failed | Check Docker build logs for Calibre installation errors. |
+
+### Step 2: Verify Your Amazon Settings
+
+This is the most common reason for failure.
+
+1.  **Approve Your Sending Email**
+    - Go to [Amazon's Manage Your Content and Devices](https://www.amazon.com/gp/digital/fiona/)
+    - Navigate to **Preferences > Personal Document Settings**.
+    - Under **Approved Personal Document E-mail List**, click **Add a new approved e-mail address**.
+    - Add the email address you configured in `UBOT_EMAIL_FROM`.
+
+2.  **Check Your Kindle's Email Address**
+    - On the same page, find your Kindle device in the **Send-to-Kindle E-Mail Settings** list.
+    - Ensure the email address matches what you have in `UBOT_EMAIL_TO` or `UBOT_KINDLE_DEVICES`.
+
+### Step 3: Use an App-Specific Password
+
+Do **NOT** use your main email password. You must generate an app-specific password.
+
+- **Gmail**: [Create an App Password](https://myaccount.google.com/apppasswords) (requires 2-Factor Authentication).
+- **Yandex**: [Generate an App Password](https://passport.yandex.ru/) under "Security".
+- **Outlook**: [Create an App Password](https://account.live.com/) under "Security".
+
+Update the `UBOT_PASSWORD` in your `.env` file with this new password.
+
+### Step 4: Verify SMTP Settings
+
+Check your `.env` file for the correct SMTP configuration.
+
+| Provider | `UBOT_SMTP_HOST` | `UBOT_SMTP_PORT` |
+|---|---|---|
+| Gmail | `smtp.gmail.com` | `587` |
+| Yandex | `smtp.yandex.com` | `587` |
+| Outlook | `smtp.live.com` | `587` |
+
+**Important**: `UBOT_SMTP_HOST` should **NOT** include the port (e.g., `smtp.gmail.com`, not `smtp.gmail.com:587`).
+
+### Step 5: Check `.env` File Syntax
+
+Ensure your `.env` file has no syntax errors:
+
+- **NO** spaces around the `=` sign (`UBOT_TOKEN=...`, not `UBOT_TOKEN = ...`).
+- **NO** comments on the same line as a variable.
+- **NO** empty variables that are required.
+
+### Quick Diagnostic Checklist
+
+- [ ] Have you checked the `docker-compose logs` for errors?
+- [ ] Is your `UBOT_EMAIL_FROM` address in Amazon's approved senders list?
+- [ ] Are you using an **app-specific password** for `UBOT_PASSWORD`?
+- [ ] Is your `UBOT_EMAIL_TO` address correct?
+- [ ] Are your `UBOT_SMTP_HOST` and `UBOT_SMTP_PORT` correct?
+- [ ] Have you checked your `.env` file for syntax errors?
